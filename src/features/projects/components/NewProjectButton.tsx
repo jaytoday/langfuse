@@ -13,7 +13,6 @@ import { useForm } from "react-hook-form";
 import {
   Form,
   FormControl,
-  FormDescription,
   FormField,
   FormItem,
   FormLabel,
@@ -24,6 +23,9 @@ import { api } from "@/src/utils/api";
 import { useRouter } from "next/router";
 import { cn } from "@/src/utils/tailwind";
 import { useState } from "react";
+import { useSession } from "next-auth/react";
+import { chatRunTrigger } from "@/src/features/support-chat/chat";
+import { usePostHog } from "posthog-js/react";
 
 const formSchema = z.object({
   name: z.string().min(3, "Must have at least 3 characters"),
@@ -34,6 +36,7 @@ interface NewProjectButtonProps {
 }
 export function NewProjectButton({ size = "default" }: NewProjectButtonProps) {
   const [open, setOpen] = useState(false);
+  const { update: updateSession } = useSession();
 
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
@@ -41,17 +44,20 @@ export function NewProjectButton({ size = "default" }: NewProjectButtonProps) {
       name: "",
     },
   });
-  const utils = api.useContext();
+  const utils = api.useUtils();
   const router = useRouter();
+  const posthog = usePostHog();
   const createProjectMutation = api.projects.create.useMutation({
     onSuccess: (newProject) => {
-      void router.push(`/project/${newProject.id}/setup`);
+      void updateSession();
+      void router.push(`/project/${newProject.id}/settings`);
       void utils.projects.invalidate();
     },
     onError: (error) => form.setError("name", { message: error.message }),
   });
 
   function onSubmit(values: z.infer<typeof formSchema>) {
+    posthog.capture("projects:new_project_form_submit");
     createProjectMutation
       .mutateAsync(values)
       .then(() => {
@@ -61,16 +67,21 @@ export function NewProjectButton({ size = "default" }: NewProjectButtonProps) {
       .catch((error) => {
         console.error(error);
       });
+    chatRunTrigger("after-project-creation");
   }
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger>
-        <Button size={size} variant={size === "xs" ? "secondary" : "default"}>
+      <DialogTrigger asChild>
+        <Button
+          size={size}
+          variant={size === "xs" ? "secondary" : "default"}
+          data-testid="create-project-btn"
+        >
           <PlusIcon
             className={cn(
               "-ml-0.5 mr-1.5",
-              size === "xs" ? "h-4 w-4" : "h-5 w-5"
+              size === "xs" ? "h-4 w-4" : "h-5 w-5",
             )}
             aria-hidden="true"
           />
@@ -86,6 +97,7 @@ export function NewProjectButton({ size = "default" }: NewProjectButtonProps) {
             // eslint-disable-next-line @typescript-eslint/no-misused-promises
             onSubmit={form.handleSubmit(onSubmit)}
             className="space-y-8"
+            data-testid="new-project-form"
           >
             <FormField
               control={form.control}
@@ -94,11 +106,12 @@ export function NewProjectButton({ size = "default" }: NewProjectButtonProps) {
                 <FormItem>
                   <FormLabel>Project name</FormLabel>
                   <FormControl>
-                    <Input placeholder="my-llm-project" {...field} />
+                    <Input
+                      placeholder="my-llm-project"
+                      {...field}
+                      data-testid="new-project-name-input"
+                    />
                   </FormControl>
-                  <FormDescription>
-                    This is your public display name.
-                  </FormDescription>
                   <FormMessage />
                 </FormItem>
               )}

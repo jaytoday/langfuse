@@ -1,59 +1,83 @@
-import { type ColumnDef } from "@tanstack/react-table";
-import { X } from "lucide-react";
-
 import { Button } from "@/src/components/ui/button";
-import { type TableRowOptions } from "@/src/components/table/types";
-import { DataTableSelectFilter } from "@/src/components/table/data-table-select-filter";
-import { DataTableNumberFilter } from "@/src/components/table/data-table-number-filter";
-import React from "react";
+import React, { type Dispatch, type SetStateAction, useState } from "react";
+import { Input } from "@/src/components/ui/input";
+import { DataTableColumnVisibilityFilter } from "@/src/components/table/data-table-column-visibility-filter";
+import { type FilterState } from "@/src/features/filters/types";
+import { FilterBuilder } from "@/src/features/filters/components/filter-builder";
+import { type ColumnDefinition } from "@/src/server/api/interfaces/tableDefinition";
+import { type VisibilityState } from "@tanstack/react-table";
+import { type LangfuseColumnDef } from "@/src/components/table/types";
+
+interface SearchConfig {
+  placeholder: string;
+  updateQuery(event: string): void;
+  currentQuery?: string;
+}
 
 interface DataTableToolbarProps<TData, TValue> {
-  columnDefs: ColumnDef<TData, TValue>[];
-  options: TableRowOptions[];
-  resetFilters: () => void;
-  isFiltered: () => boolean;
+  columns: LangfuseColumnDef<TData, TValue>[];
+  filterColumnDefinition: ColumnDefinition[];
+  searchConfig?: SearchConfig;
+  actionButtons?: React.ReactNode;
+  filterState: FilterState;
+  setFilterState: Dispatch<SetStateAction<FilterState>>;
+  columnVisibility?: VisibilityState;
+  setColumnVisibility?: Dispatch<SetStateAction<VisibilityState>>;
 }
 
 export function DataTableToolbar<TData, TValue>({
-  columnDefs,
-  options,
-  resetFilters,
-  isFiltered,
+  columns,
+  filterColumnDefinition,
+  searchConfig,
+  actionButtons,
+  filterState,
+  setFilterState,
+  columnVisibility,
+  setColumnVisibility,
 }: DataTableToolbarProps<TData, TValue>) {
+  const [searchString, setSearchString] = useState(
+    searchConfig?.currentQuery ?? "",
+  );
+
   return (
-    <div className="flex items-center justify-between">
+    <div className="my-2 flex max-w-full items-center justify-between overflow-x-auto">
       <div className="flex flex-1 items-center space-x-2">
-        {columnDefs.map((column) => {
-          const columnOptions = options.find(
-            (o) =>
-              o.columnId.toLowerCase() === column.meta?.label?.toLowerCase()
-          );
-          return column.enableColumnFilter && columnOptions ? (
-            column.meta?.filter?.type === "select" ? (
-              <DataTableSelectFilter
-                title={column.meta?.label}
-                meta={column.meta?.filter}
-                options={columnOptions}
-              />
-            ) : column.meta?.filter?.type === "number-comparison" ? (
-              <DataTableNumberFilter
-                title={column.meta?.label}
-                meta={column.meta?.filter}
-                options={columnOptions}
-              />
-            ) : undefined
-          ) : undefined;
-        })}
-        {isFiltered() && (
-          <Button
-            variant="ghost"
-            onClick={() => resetFilters()}
-            className="h-8 px-2 lg:px-3"
-          >
-            Reset
-            <X className="ml-2 h-4 w-4" />
-          </Button>
+        {searchConfig && (
+          <div className="flex max-w-md items-center space-x-2">
+            <Input
+              autoFocus
+              placeholder={searchConfig.placeholder}
+              value={searchString}
+              onChange={(event) => setSearchString(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  searchConfig.updateQuery(searchString);
+                }
+              }}
+              className="h-10 w-[200px] lg:w-[350px]"
+            />
+            <Button
+              variant="outline"
+              onClick={() => searchConfig.updateQuery(searchString)}
+            >
+              Search
+            </Button>
+          </div>
         )}
+        <FilterBuilder
+          columns={filterColumnDefinition}
+          filterState={filterState}
+          onChange={setFilterState}
+        />
+        <div className="flex-1" />
+        {!!columnVisibility && !!setColumnVisibility && (
+          <DataTableColumnVisibilityFilter
+            columns={columns}
+            columnVisibility={columnVisibility}
+            setColumnVisibility={setColumnVisibility}
+          />
+        )}
+        {actionButtons}
       </div>
     </div>
   );

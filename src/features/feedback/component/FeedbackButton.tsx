@@ -27,7 +27,7 @@ const formSchema = z.object({
 });
 
 export function FeedbackButtonWrapper(
-  props: PropsWithChildren<{ className?: string }>
+  props: PropsWithChildren<{ className?: string }>,
 ) {
   const [open, setOpen] = useState(false);
   const session = useSession();
@@ -84,7 +84,7 @@ export function FeedbackButtonWrapper(
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger className={props.className}>
+      <DialogTrigger className={props.className} asChild>
         {props.children}
       </DialogTrigger>
       <DialogContent>

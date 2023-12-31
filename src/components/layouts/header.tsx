@@ -1,12 +1,35 @@
 import { ChevronLeftIcon, ChevronRightIcon } from "@heroicons/react/20/solid";
 import Link from "next/link";
+import { useRouter } from "next/router";
+import { useSession } from "next-auth/react";
+import DocPopup from "@/src/components/layouts/doc-popup";
+import { type Status, StatusBadge } from "./status-badge";
 
 export default function Header(props: {
   title: string;
   breadcrumb?: { name: string; href?: string }[];
-  live?: boolean;
+  status?: Status;
+  help?: { description: string; href: string };
   actionButtons?: React.ReactNode;
 }) {
+  const router = useRouter();
+  const session = useSession();
+
+  const currentPath = router.pathname;
+  const projectId = router.query.projectId;
+
+  const project = session.data?.user?.projects.find((p) => p.id === projectId);
+  const breadcrumb = [
+    ...(project && projectId && currentPath !== "/project/[projectId]"
+      ? [
+          {
+            name: project.name,
+            href: `/project/${projectId as string}`,
+          },
+        ]
+      : []),
+    ...(props.breadcrumb ?? []),
+  ];
   const backHref =
     props.breadcrumb &&
     [...props.breadcrumb.map((i) => i.href).filter(Boolean)].pop();
@@ -28,11 +51,11 @@ export default function Header(props: {
             </Link>
           </nav>
         ) : null}
-        {props.breadcrumb ? (
+        {breadcrumb.length ? (
           <nav className="hidden sm:flex" aria-label="Breadcrumb">
             <ol role="list" className="flex items-center space-x-4">
-              {props.breadcrumb.map(({ name, href }, index) => (
-                <li key={href}>
+              {breadcrumb.map(({ name, href }, index) => (
+                <li key={index}>
                   <div className="flex items-center">
                     {index !== 0 && (
                       <ChevronRightIcon
@@ -59,25 +82,25 @@ export default function Header(props: {
           </nav>
         ) : null}
       </div>
-      <div className="mt-2 md:flex md:items-center md:justify-between md:gap-5">
+      <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-3 md:gap-5">
-          <div className="min-w-0">
+          <div className="flex min-w-0 flex-row">
             <h2 className="text-2xl font-bold leading-7 text-gray-900 sm:truncate sm:text-3xl sm:tracking-tight">
               {props.title}
             </h2>
+            {props.help ? (
+              <DocPopup
+                description={props.help.description}
+                href={props.help.href}
+                size="sm"
+              />
+            ) : null}
           </div>
-          {props.live ? (
-            <div className="flex items-center gap-2 rounded-sm bg-green-100 px-3  text-green-600">
-              <span className="relative flex h-2 w-2 ">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-green-500 opacity-75"></span>
-                <span className="relative inline-flex h-2 w-2 rounded-full bg-green-600"></span>
-              </span>
-              Live
-            </div>
-          ) : null}
+          {props.status && <StatusBadge type={props.status} />}
         </div>
-        <div className="md:flex-1" />
-        {props.actionButtons ?? null}
+        <div className="flex items-center gap-3">
+          {props.actionButtons ?? null}
+        </div>
       </div>
     </div>
   );

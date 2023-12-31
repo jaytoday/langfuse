@@ -17,6 +17,7 @@
     "incremental": true,
     "noUncheckedIndexedAccess": true,
     "baseUrl": ".",
+    "types": ["jest", "node"],
     "paths": {
       "@/*": ["./*"]
     }
@@ -27,7 +28,8 @@
     "**/*.ts",
     "**/*.tsx",
     "**/*.cjs",
-    "**/*.mjs"
+    "**/*.mjs",
+    "src/features/navigate-detail-pages"
   ],
   "exclude": ["node_modules", "sdk"]
 }

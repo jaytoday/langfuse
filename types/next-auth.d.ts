@@ -4,6 +4,7 @@ import {
   type Membership as PrismaMembership,
   type Project as PrismaProject,
 } from "@prisma/client";
+import { type Flags } from "@/src/features/feature-flags/types";
 
 /**
  * Module augmentation for `next-auth` types. Allows us to add custom properties to the `session`
@@ -21,12 +22,14 @@ declare module "next-auth" {
     name?: PrismaUser["name"];
     email?: PrismaUser["email"];
     image?: PrismaUser["image"];
+    admin?: PrismaUser["admin"];
     emailVerified?: PrismaUser["emailVerified"];
     projects: {
       id: PrismaProject["id"];
       name: PrismaProject["name"];
       role: PrismaMembership["role"];
     }[];
+    featureFlags: Flags;
   }
 }
 

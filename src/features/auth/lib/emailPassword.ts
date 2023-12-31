@@ -1,3 +1,4 @@
+import { createProjectMembershipsOnSignup } from "@/src/features/auth/lib/createProjectMembershipsOnSignup";
 import { prisma } from "@/src/server/db";
 import { compare, hash } from "bcryptjs";
 
@@ -13,28 +14,32 @@ import { compare, hash } from "bcryptjs";
 export async function createUserEmailPassword(
   email: string,
   password: string,
-  name: string
+  name: string,
 ) {
-  if (!isValidPassword(password)) throw new Error("Invalid password");
+  if (!isValidPassword(password))
+    throw new Error("Password needs to be at least 8 characters long.");
 
   const hashedPassword = await hashPassword(password);
   // check that no user exists with this email
   const user = await prisma.user.findUnique({
     where: {
-      email,
+      email: email.toLowerCase(),
     },
   });
   if (user !== null) {
-    throw new Error("User already exists");
+    throw new Error("User with email already exists. Please sign in.");
   }
 
   const newUser = await prisma.user.create({
     data: {
-      email,
+      email: email.toLowerCase(),
       password: hashedPassword,
       name,
     },
   });
+
+  await createProjectMembershipsOnSignup(newUser);
+
   return newUser.id;
 }
 

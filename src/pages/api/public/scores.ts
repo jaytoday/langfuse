@@ -1,98 +1,140 @@
 import { prisma } from "@/src/server/db";
-import { type Prisma } from "@prisma/client";
+import { Prisma, type Score } from "@prisma/client";
 import { type NextApiRequest, type NextApiResponse } from "next";
 import { z } from "zod";
-import { cors, runMiddleware } from "./cors";
-import { verifyAuthHeaderAndReturnScope } from "@/src/features/publicApi/server/apiAuth";
-import { checkApiAccessScope } from "@/src/features/publicApi/server/apiScope";
+import { cors, runMiddleware } from "@/src/features/public-api/server/cors";
+import { verifyAuthHeaderAndReturnScope } from "@/src/features/public-api/server/apiAuth";
+import { paginationZod } from "@/src/utils/zod";
+import {
+  ScoreBody,
+  eventTypes,
+  ingestionBatchEvent,
+} from "@/src/features/public-api/server/ingestion-api-schema";
+import { v4 } from "uuid";
+import {
+  handleBatch,
+  handleBatchResultLegacy,
+} from "@/src/pages/api/public/ingestion";
 
-const ScoreSchema = z.object({
-  name: z.string(),
-  value: z.number().int(),
-  traceId: z.string(),
-  traceIdType: z.enum(["LANGFUSE", "EXTERNAL"]).nullish(),
-  observationId: z.string().nullish(),
+const ScoresGetSchema = z.object({
+  ...paginationZod,
+  userId: z.string().nullish(),
+  name: z.string().nullish(),
 });
 
 export default async function handler(
   req: NextApiRequest,
-  res: NextApiResponse
+  res: NextApiResponse,
 ) {
   await runMiddleware(req, res, cors);
 
-  if (req.method !== "POST") {
-    return res.status(405).json({ message: "Method not allowed" });
-  }
-
   // CHECK AUTH
   const authCheck = await verifyAuthHeaderAndReturnScope(
-    req.headers.authorization
+    req.headers.authorization,
   );
   if (!authCheck.validKey)
     return res.status(401).json({
-      success: false,
       message: authCheck.error,
     });
   // END CHECK AUTH
 
-  try {
-    const obj = ScoreSchema.parse(req.body);
+  if (req.method === "POST") {
+    try {
+      console.log(
+        "trying to create score, project ",
+        authCheck.scope.projectId,
+        ", body:",
+        JSON.stringify(req.body, null, 2),
+      );
 
-    // If externalTraceId is provided, find the traceId
-    const traceId =
-      obj.traceIdType === "EXTERNAL"
-        ? (
-            await prisma.trace.findUniqueOrThrow({
-              where: {
-                projectId_externalId: {
-                  projectId: authCheck.scope.projectId,
-                  externalId: obj.traceId,
-                },
-              },
-            })
-          ).id
-        : obj.traceId;
+      const event = {
+        id: v4(),
+        type: eventTypes.SCORE_CREATE,
+        timestamp: new Date().toISOString(),
+        body: ScoreBody.parse(req.body),
+      };
 
-    // CHECK ACCESS SCOPE
-    const accessCheck = await checkApiAccessScope(
-      authCheck.scope,
-      [
-        { type: "trace", id: traceId },
-        ...(obj.observationId
-          ? [{ type: "observation" as const, id: obj.observationId }]
-          : []),
-      ],
-      "score"
-    );
-    if (!accessCheck)
-      return res.status(403).json({
-        success: false,
-        message: "Access denied",
+      const result = await handleBatch(
+        ingestionBatchEvent.parse([event]),
+        {},
+        req,
+        authCheck,
+      );
+
+      handleBatchResultLegacy(result.errors, result.results, res);
+    } catch (error: unknown) {
+      console.error(error);
+      const errorMessage =
+        error instanceof Error ? error.message : "An unknown error occurred";
+      res.status(400).json({
+        message: "Invalid request data",
+        error: errorMessage,
       });
-    // END CHECK ACCESS SCOPE
+    }
+  } else if (req.method === "GET") {
+    try {
+      if (authCheck.scope.accessLevel !== "all") {
+        return res.status(401).json({
+          message:
+            "Access denied - need to use basic auth with secret key to GET scores",
+        });
+      }
 
-    const data: Prisma.ScoreCreateInput = {
-      timestamp: new Date(),
-      value: obj.value,
-      name: obj.name,
-      trace: { connect: { id: traceId } },
-      ...(obj.observationId && {
-        observation: { connect: { id: obj.observationId } },
-      }),
-    };
+      const obj = ScoresGetSchema.parse(req.query); // uses query and not body
 
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-    const newScore = await prisma.score.create({ data });
+      const skipValue = (obj.page - 1) * obj.limit;
+      const userCondition = Prisma.sql`AND t."user_id" = ${obj.userId}`;
+      const nameCondition = Prisma.sql`AND s."name" = ${obj.name}`;
 
-    res.status(200).json(newScore);
-  } catch (error: unknown) {
-    console.error(error);
-    const errorMessage =
-      error instanceof Error ? error.message : "An unknown error occurred";
-    res.status(400).json({
-      success: false,
-      message: "Invalid request data",
-      error: errorMessage,
-    });
+      const scores = await prisma.$queryRaw<
+        Array<Score & { trace: { userId: string } }>
+      >(Prisma.sql`
+          SELECT
+            s.id,
+            s.timestamp,
+            s.name,
+            s.value,
+            s.comment,
+            s.trace_id as "traceId",
+            s.observation_id as "observationId",
+            json_build_object('userId', t.user_id) as "trace"
+          FROM "scores" AS s
+          JOIN "traces" AS t ON t.id = s.trace_id
+          WHERE t.project_id = ${authCheck.scope.projectId}
+          ${obj.userId ? userCondition : Prisma.empty}
+          ${obj.name ? nameCondition : Prisma.empty}
+          ORDER BY t."timestamp" DESC
+          LIMIT ${obj.limit} OFFSET ${skipValue}
+          `);
+      const totalItems = await prisma.score.count({
+        where: {
+          name: obj.name ?? undefined, // optional filter
+          trace: {
+            projectId: authCheck.scope.projectId,
+            userId: obj.userId ?? undefined, // optional filter
+          },
+        },
+      });
+
+      return res.status(200).json({
+        data: scores,
+        meta: {
+          page: obj.page,
+          limit: obj.limit,
+          totalItems,
+          totalPages: Math.ceil(totalItems / obj.limit),
+        },
+      });
+    } catch (error: unknown) {
+      console.error(error);
+      const errorMessage =
+        error instanceof Error ? error.message : "An unknown error occurred";
+      res.status(400).json({
+        message: "Invalid request data",
+        error: errorMessage,
+      });
+    }
+  } else {
+    return res.status(405).json({ message: "Method not allowed" });
   }
 }

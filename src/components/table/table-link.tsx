@@ -1,25 +1,25 @@
-import { lastCharacters } from "@/src/utils/string";
-import { useRouter } from "next/router";
+import Link from "next/link";
 
 export type TableLinkProps = {
   path: string;
   value: string;
+  truncateAt?: number;
 };
 
-export default function TableLink({ path, value }: TableLinkProps) {
-  const router = useRouter();
-
+export default function TableLink({
+  path,
+  value,
+  truncateAt = 7,
+}: TableLinkProps) {
   return (
-    <div>
-      <button
-        key="openTrace"
-        className="rounded bg-indigo-50 px-2 py-1 text-xs font-semibold text-blue-600 shadow-sm hover:bg-indigo-100"
-        onClick={() => {
-          void router.push(path);
-        }}
-      >
-        ...{lastCharacters(value, 7)}
-      </button>
-    </div>
+    <Link
+      className="inline-block rounded bg-indigo-50 px-2 py-1 text-xs font-semibold text-blue-600 shadow-sm hover:bg-indigo-100"
+      href={path}
+      title={value}
+    >
+      {value.length > truncateAt
+        ? `...${value.substring(value.length - truncateAt)}`
+        : value}
+    </Link>
   );
 }

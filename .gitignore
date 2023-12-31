@@ -20,6 +20,9 @@ next-env.d.ts
 # production
 /build
 
+# idea
+.idea
+
 # misc
 .DS_Store
 *.pem
@@ -34,6 +37,7 @@ yarn-error.log*
 # do not commit any .env files to git, except for the .env.example file. https://create.t3.gg/en/usage/env-variables#using-environment-variables
 .env
 .env.local
+.env*.local
 
 # vercel
 .vercel
@@ -42,3 +46,6 @@ yarn-error.log*
 *.tsbuildinfo
 
 /generated/typescript-server
+
+# openapi spec that is copied during build
+/public/openapi*.yml

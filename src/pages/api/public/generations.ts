@@ -1,255 +1,135 @@
-import { prisma } from "@/src/server/db";
-import { ObservationLevel, ObservationType } from "@prisma/client";
 import { type NextApiRequest, type NextApiResponse } from "next";
-import { z } from "zod";
-import { cors, runMiddleware } from "./cors";
-import { verifyAuthHeaderAndReturnScope } from "@/src/features/publicApi/server/apiAuth";
-import { checkApiAccessScope } from "@/src/features/publicApi/server/apiScope";
-
-const GenerationsCreateSchema = z.object({
-  traceId: z.string().nullish(),
-  traceIdType: z.enum(["LANGFUSE", "EXTERNAL"]).nullish(),
-  name: z.string().nullish(),
-  startTime: z.string().datetime().nullish(),
-  endTime: z.string().datetime().nullish(),
-  completionStartTime: z.string().datetime().nullish(),
-  model: z.string().nullish(),
-  modelParameters: z
-    .record(
-      z.string(),
-      z.union([z.string(), z.number(), z.boolean()]).nullish()
-    )
-    .nullish(),
-  prompt: z.unknown().nullish(),
-  completion: z.string().nullish(),
-  usage: z
-    .object({
-      promptTokens: z.number().nullish(),
-      completionTokens: z.number().nullish(),
-      totalTokens: z.number().nullish(),
-    })
-    .nullish(),
-  metadata: z.unknown().nullish(),
-  parentObservationId: z.string().nullish(),
-  level: z.nativeEnum(ObservationLevel).nullish(),
-  statusMessage: z.string().nullish(),
-});
-
-const GenerationPatchSchema = z.object({
-  generationId: z.string(),
-  name: z.string().nullish(),
-  endTime: z.string().datetime().nullish(),
-  completionStartTime: z.string().datetime().nullish(),
-  model: z.string().nullish(),
-  modelParameters: z
-    .record(
-      z.string(),
-      z.union([z.string(), z.number(), z.boolean()]).nullish()
-    )
-    .nullish(),
-  prompt: z.unknown().nullish(),
-  completion: z.string().nullish(),
-  usage: z.object({
-    promptTokens: z.number().nullish(),
-    completionTokens: z.number().nullish(),
-    totalTokens: z.number().nullish(),
-  }),
-  metadata: z.unknown().nullish(),
-  level: z.nativeEnum(ObservationLevel).nullish(),
-  statusMessage: z.string().nullish(),
-});
+import { cors, runMiddleware } from "@/src/features/public-api/server/cors";
+import { verifyAuthHeaderAndReturnScope } from "@/src/features/public-api/server/apiAuth";
+import { v4 as uuidv4 } from "uuid";
+import { ResourceNotFoundError } from "../../../utils/exceptions";
+import {
+  LegacyGenerationPatchSchema,
+  LegacyGenerationsCreateSchema,
+  eventTypes,
+  ingestionBatchEvent,
+} from "@/src/features/public-api/server/ingestion-api-schema";
+import {
+  handleBatch,
+  handleBatchResultLegacy,
+} from "@/src/pages/api/public/ingestion";
+import { type z } from "zod";
 
 export default async function handler(
   req: NextApiRequest,
-  res: NextApiResponse
+  res: NextApiResponse,
 ) {
   await runMiddleware(req, res, cors);
 
-  if (req.method !== "POST") {
-    return res.status(405).json({ message: "Method not allowed" });
-  }
-
   // CHECK AUTH
   const authCheck = await verifyAuthHeaderAndReturnScope(
-    req.headers.authorization
+    req.headers.authorization,
   );
   if (!authCheck.validKey)
     return res.status(401).json({
-      success: false,
       message: authCheck.error,
     });
   // END CHECK AUTH
 
   if (req.method === "POST") {
     try {
-      const obj = GenerationsCreateSchema.parse(req.body);
-      const {
-        name,
-        startTime,
-        endTime,
-        completionStartTime,
-        model,
-        modelParameters,
-        prompt,
-        completion,
-        usage,
-        metadata,
-        parentObservationId,
-        level,
-        statusMessage,
-      } = obj;
+      console.log(
+        "trying to create observation for generation, project ",
+        authCheck.scope.projectId,
+        ", body:",
+        JSON.stringify(req.body, null, 2),
+      );
 
-      // If externalTraceId is provided, find or create the traceId
-      const traceId =
-        obj.traceIdType === "EXTERNAL" && obj.traceId
-          ? (
-              await prisma.trace.upsert({
-                where: {
-                  projectId_externalId: {
-                    projectId: authCheck.scope.projectId,
-                    externalId: obj.traceId,
-                  },
-                },
-                create: {
-                  projectId: authCheck.scope.projectId,
-                  externalId: obj.traceId,
-                },
-                update: {},
-              })
-            ).id
-          : obj.traceId;
+      const convertToObservation = (
+        generation: z.infer<typeof LegacyGenerationsCreateSchema>,
+      ) => {
+        return {
+          ...generation,
+          type: "GENERATION",
+          input: generation.prompt,
+          output: generation.completion,
+        };
+      };
 
-      // CHECK ACCESS SCOPE
-      const accessCheck = await checkApiAccessScope(authCheck.scope, [
-        ...(traceId ? [{ type: "trace" as const, id: traceId }] : []),
-        ...(parentObservationId
-          ? [{ type: "observation" as const, id: parentObservationId }]
-          : []),
-      ]);
-      if (!accessCheck)
-        return res.status(403).json({
-          success: false,
-          message: "Access denied",
-        });
-      // END CHECK ACCESS SCOPE
+      const event = {
+        id: uuidv4(),
+        type: eventTypes.OBSERVATION_CREATE,
+        timestamp: new Date().toISOString(),
+        body: convertToObservation(
+          LegacyGenerationsCreateSchema.parse(req.body),
+        ),
+      };
 
-      const calculatedUsage = usage
-        ? {
-            ...usage,
-            totalTokens:
-              !usage.totalTokens &&
-              (usage.promptTokens || usage.completionTokens)
-                ? (usage.promptTokens ?? 0) + (usage.completionTokens ?? 0)
-                : usage.totalTokens,
-          }
-        : undefined;
+      const result = await handleBatch(
+        ingestionBatchEvent.parse([event]),
+        {},
+        req,
+        authCheck,
+      );
 
-      const newObservation = await prisma.observation.create({
-        data: {
-          ...(traceId
-            ? { trace: { connect: { id: traceId } } }
-            : {
-                trace: {
-                  create: {
-                    name: name,
-                    project: { connect: { id: authCheck.scope.projectId } },
-                  },
-                },
-              }),
-          type: ObservationType.GENERATION,
-          name,
-          startTime: startTime ? new Date(startTime) : undefined,
-          endTime: endTime ? new Date(endTime) : undefined,
-          completionStartTime: completionStartTime
-            ? new Date(completionStartTime)
-            : undefined,
-          metadata: metadata ?? undefined,
-          model: model ?? undefined,
-          modelParameters: modelParameters ?? undefined,
-          input: prompt ?? undefined,
-          output: completion ? { completion: completion } : undefined,
-          usage: calculatedUsage,
-          level: level ?? undefined,
-          statusMessage: statusMessage ?? undefined,
-          parent: parentObservationId
-            ? { connect: { id: parentObservationId } }
-            : undefined,
-        },
-      });
-
-      res.status(200).json(newObservation);
+      handleBatchResultLegacy(result.errors, result.results, res);
     } catch (error: unknown) {
       console.error(error);
       const errorMessage =
         error instanceof Error ? error.message : "An unknown error occurred";
       res.status(400).json({
-        success: false,
         message: "Invalid request data",
         error: errorMessage,
       });
     }
   } else if (req.method === "PATCH") {
     try {
-      const {
-        generationId,
-        endTime,
-        completionStartTime,
-        prompt,
-        completion,
-        usage,
-        ...fields
-      } = GenerationPatchSchema.parse(req.body);
+      console.log(
+        "trying to update observation for generation, project ",
+        authCheck.scope.projectId,
+        ", body:",
+        JSON.stringify(req.body, null, 2),
+      );
 
-      // CHECK ACCESS SCOPE
-      const accessCheck = await checkApiAccessScope(authCheck.scope, [
-        { type: "observation", id: generationId },
-      ]);
-      if (!accessCheck)
-        return res.status(403).json({
-          success: false,
-          message: "Access denied",
-        });
-      // END CHECK ACCESS SCOPE
+      const convertToObservation = (
+        generation: z.infer<typeof LegacyGenerationPatchSchema>,
+      ) => {
+        return {
+          ...generation,
+          id: generation.generationId,
+          type: "GENERATION",
+          input: generation.prompt,
+          output: generation.completion,
+        };
+      };
 
-      const calculatedUsage = usage
-        ? {
-            ...usage,
-            totalTokens:
-              !usage.totalTokens &&
-              (usage.promptTokens || usage.completionTokens)
-                ? (usage.promptTokens ?? 0) + (usage.completionTokens ?? 0)
-                : usage.totalTokens,
-          }
-        : undefined;
+      const event = {
+        id: uuidv4(),
+        type: eventTypes.OBSERVATION_UPDATE,
+        timestamp: new Date().toISOString(),
+        body: convertToObservation(LegacyGenerationPatchSchema.parse(req.body)),
+      };
 
-      const newObservation = await prisma.observation.update({
-        where: { id: generationId },
-        data: {
-          endTime: endTime ? new Date(endTime) : undefined,
-          completionStartTime: completionStartTime
-            ? new Date(completionStartTime)
-            : undefined,
-          input: prompt ?? undefined,
-          output: completion ? { completion: completion } : undefined,
-          usage: calculatedUsage,
-          ...Object.fromEntries(
-            Object.entries(fields).filter(
-              ([_, v]) => v !== null && v !== undefined
-            )
-          ),
-        },
-      });
+      const result = await handleBatch(
+        ingestionBatchEvent.parse([event]),
+        {},
+        req,
+        authCheck,
+      );
 
-      res.status(200).json(newObservation);
+      handleBatchResultLegacy(result.errors, result.results, res);
     } catch (error: unknown) {
       console.error(error);
+
+      if (error instanceof ResourceNotFoundError) {
+        return res.status(404).json({
+          message: "Observation not found",
+        });
+      }
+
       const errorMessage =
         error instanceof Error ? error.message : "An unknown error occurred";
       res.status(400).json({
-        success: false,
         message: "Invalid request data",
         error: errorMessage,
       });
     }
+  } else {
+    return res.status(405).json({ message: "Method not allowed" });
   }
 }

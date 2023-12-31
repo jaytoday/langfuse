@@ -2,129 +2,422 @@ import { z } from "zod";
 
 import {
   createTRPCRouter,
-  protectedProcedure,
   protectedProjectProcedure,
 } from "@/src/server/api/trpc";
-import { type Generation } from "@/src/utils/types";
+
+import { type Observation, Prisma } from "@prisma/client";
+import { paginationZod } from "@/src/utils/zod";
+import { singleFilter } from "@/src/server/api/interfaces/filters";
+import {
+  datetimeFilterToPrismaSql,
+  filterToPrismaSql,
+} from "@/src/features/filters/server/filterToPrisma";
+import {
+  type ObservationOptions,
+  observationsTableCols,
+} from "@/src/server/api/definitions/observationsTable";
+import { calculateTokenCost } from "@/src/features/ingest/lib/usage";
+import Decimal from "decimal.js";
+import { usdFormatter } from "@/src/utils/numbers";
+import { env } from "@/src/env.mjs";
+import {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+} from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import {
+  exportFileFormats,
+  exportOptions,
+} from "@/src/server/api/interfaces/exportTypes";
 
 const GenerationFilterOptions = z.object({
-  traceId: z.array(z.string()).nullable(),
-  id: z.array(z.string()).nullable(),
   projectId: z.string(), // Required for protectedProjectProcedure
+  filter: z.array(singleFilter),
+  searchQuery: z.string().nullable(),
+});
+
+const ListInputs = GenerationFilterOptions.extend({
+  ...paginationZod,
+});
+
+// extend generationfilteroptions with export options
+const ExportInputs = GenerationFilterOptions.extend({
+  fileFormat: z.enum(exportFileFormats),
 });
 
 export const generationsRouter = createTRPCRouter({
   all: protectedProjectProcedure
-    .input(GenerationFilterOptions)
+    .input(ListInputs)
     .query(async ({ input, ctx }) => {
-      const generations = (await ctx.prisma.observation.findMany({
-        where: {
-          type: "GENERATION",
-          trace: {
-            projectId: input.projectId,
-          },
-          ...(input.traceId
-            ? {
-                traceId: { in: input.traceId },
-              }
-            : undefined),
-          ...(input.id
-            ? {
-                id: { in: input.id },
-              }
-            : undefined),
-        },
-        orderBy: {
-          startTime: "desc",
-        },
-        take: 100, // TODO: pagination
-      })) as Generation[];
+      const searchCondition = input.searchQuery
+        ? Prisma.sql`AND (
+        o."id" ILIKE ${`%${input.searchQuery}%`} OR
+        o."name" ILIKE ${`%${input.searchQuery}%`} OR
+        o."model" ILIKE ${`%${input.searchQuery}%`} OR
+        t."name" ILIKE ${`%${input.searchQuery}%`}
+      )`
+        : Prisma.empty;
 
-      return generations;
+      const filterCondition = filterToPrismaSql(
+        input.filter,
+        observationsTableCols,
+      );
+
+      // to improve query performance, add timeseries filter to observation queries as well
+      const startTimeFilter = input.filter.find(
+        (f) => f.column === "start_time" && f.type === "datetime",
+      );
+      const datetimeFilter =
+        startTimeFilter && startTimeFilter.type === "datetime"
+          ? datetimeFilterToPrismaSql(
+              "start_time",
+              startTimeFilter.operator,
+              startTimeFilter.value,
+            )
+          : Prisma.empty;
+
+      const generations = await ctx.prisma.$queryRaw<
+        Array<
+          Observation & {
+            traceId: string;
+            traceName: string;
+            totalCount: number;
+            latency: number | null;
+          }
+        >
+      >(
+        Prisma.sql`
+          WITH observations_with_latency AS (
+            SELECT
+              o.*,
+              CASE WHEN o.end_time IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM o."end_time") - EXTRACT(EPOCH FROM o."start_time"))::double precision END AS "latency"
+            FROM observations o
+            WHERE o.type = 'GENERATION'
+            AND o.project_id = ${input.projectId}
+            ${datetimeFilter}
+          )
+          SELECT
+            o.id,
+            o.name,
+            o.model,
+            o.start_time as "startTime",
+            o.end_time as "endTime",
+            o.latency,
+            o.input,
+            o.output,
+            o.metadata,
+            o.trace_id as "traceId",
+            t.name as "traceName",
+            o.completion_start_time as "completionStartTime",
+            o.prompt_tokens as "promptTokens",
+            o.completion_tokens as "completionTokens",
+            o.total_tokens as "totalTokens",
+            o.level,
+            o.status_message as "statusMessage",
+            o.version,
+            (count(*) OVER())::int AS "totalCount"
+          FROM observations_with_latency o
+          JOIN traces t ON t.id = o.trace_id
+          WHERE
+            t.project_id = ${input.projectId}
+            ${searchCondition}
+            ${filterCondition}
+          ORDER BY o.start_time DESC
+          LIMIT ${input.limit}
+          OFFSET ${input.page * input.limit}
+        `,
+      );
+
+      const pricings = await ctx.prisma.pricing.findMany();
+
+      return generations.map(({ input, output, ...rest }) => {
+        return {
+          ...rest,
+          input,
+          output,
+          cost: rest.model
+            ? calculateTokenCost(pricings, {
+                model: rest.model,
+                totalTokens: new Decimal(rest.totalTokens),
+                promptTokens: new Decimal(rest.promptTokens),
+                completionTokens: new Decimal(rest.completionTokens),
+                input: input,
+                output: output,
+              })
+            : undefined,
+        };
+      });
     }),
 
-  availableFilterOptions: protectedProjectProcedure
-    .input(GenerationFilterOptions)
+  export: protectedProjectProcedure
+    .input(ExportInputs)
     .query(async ({ input, ctx }) => {
-      const filter = {
-        trace: {
-          projectId: input.projectId,
-        },
-        ...(input.traceId
-          ? {
-              traceId: { in: input.traceId },
-            }
-          : undefined),
-        ...(input.id
-          ? {
-              id: { in: input.id },
-            }
-          : undefined),
-      };
+      const searchCondition = input.searchQuery
+        ? Prisma.sql`AND (
+        o."id" ILIKE ${`%${input.searchQuery}%`} OR
+        o."name" ILIKE ${`%${input.searchQuery}%`} OR
+        o."model" ILIKE ${`%${input.searchQuery}%`} OR
+        t."name" ILIKE ${`%${input.searchQuery}%`}
+      )`
+        : Prisma.empty;
 
-      const [ids, traceIds] = await Promise.all([
-        ctx.prisma.observation.groupBy({
-          where: {
-            type: "GENERATION",
-            ...filter,
-          },
-          by: ["id"],
-          _count: {
-            _all: true,
-          },
-        }),
-        ctx.prisma.observation.groupBy({
-          where: {
-            type: "GENERATION",
-            ...filter,
-          },
-          by: ["traceId"],
-          _count: {
-            _all: true,
-          },
-        }),
-      ]);
+      const filterCondition = filterToPrismaSql(
+        input.filter,
+        observationsTableCols,
+      );
+      console.log("filters: ", filterCondition);
 
-      return [
-        {
-          key: "id",
-          occurrences: ids.map((i) => {
-            return { key: i.id, count: i._count };
-          }),
+      const generations = await ctx.prisma.$queryRaw<
+        Array<
+          Observation & {
+            traceId: string;
+            traceName: string;
+          }
+        >
+      >(
+        Prisma.sql`
+          SELECT
+            o.id,
+            o.name,
+            o.model,
+            o.start_time as "startTime",
+            o.end_time as "endTime",
+            o.input,
+            o.output,
+            o.metadata,
+            o.trace_id as "traceId",
+            t.name as "traceName",
+            o.completion_start_time as "completionStartTime",
+            o.prompt_tokens as "promptTokens",
+            o.completion_tokens as "completionTokens",
+            o.total_tokens as "totalTokens",
+            o.version
+          FROM observations o
+          JOIN traces t ON t.id = o.trace_id
+          WHERE o.type = 'GENERATION'
+            AND o.project_id = ${input.projectId}
+            AND t.project_id = ${input.projectId}
+            ${searchCondition}
+            ${filterCondition}
+          ORDER BY o.start_time DESC
+        `,
+      );
+
+      const pricings = await ctx.prisma.pricing.findMany();
+
+      const enrichedGenerations = generations.map(
+        ({ input, output, ...rest }) => {
+          return {
+            ...rest,
+            input,
+            output,
+            cost: rest.model
+              ? calculateTokenCost(pricings, {
+                  model: rest.model,
+                  totalTokens: new Decimal(rest.totalTokens),
+                  promptTokens: new Decimal(rest.promptTokens),
+                  completionTokens: new Decimal(rest.completionTokens),
+                  input: input,
+                  output: output,
+                })
+              : undefined,
+          };
         },
-        {
-          key: "traceId",
-          occurrences: traceIds.map((i) => {
-            return { key: i.traceId, count: i._count };
+      );
+
+      let output: string = "";
+
+      // create file
+      switch (input.fileFormat) {
+        case "CSV":
+          output = [
+            [
+              "traceId",
+              "name",
+              "model",
+              "startTime",
+              "endTime",
+              "cost",
+              "prompt",
+              "completion",
+              "metadata",
+            ],
+          ]
+            .concat(
+              enrichedGenerations.map((generation) =>
+                [
+                  generation.traceId,
+                  generation.name ?? "",
+                  generation.model ?? "",
+                  generation.startTime.toISOString(),
+                  generation.endTime?.toISOString() ?? "",
+                  generation.cost
+                    ? usdFormatter(generation.cost.toNumber())
+                    : "",
+                  JSON.stringify(generation.input),
+                  JSON.stringify(generation.output),
+                  JSON.stringify(generation.metadata),
+                ].map((field) => {
+                  const str = typeof field === "string" ? field : String(field);
+                  return `"${str.replace(/"/g, '""')}"`;
+                }),
+              ),
+            )
+            .map((row) => row.join(","))
+            .join("\n");
+          break;
+        case "JSON":
+          output = JSON.stringify(enrichedGenerations);
+          break;
+        case "OPENAI-JSONL":
+          const inputSchemaOpenAI = z.array(
+            z.object({
+              role: z.enum(["system", "user", "assistant"]),
+              content: z.string(),
+            }),
+          );
+          const outputSchema = z.object({
+            completion: z.string(),
+          });
+          output = enrichedGenerations
+            .map((generation) => ({
+              parsedInput: inputSchemaOpenAI.safeParse(generation.input),
+              parsedOutput: outputSchema.safeParse(generation.output),
+            }))
+            .filter((generation) => generation.parsedInput.success)
+            .map((generation) =>
+              generation.parsedInput.success // check for typescript validation, is always true due to previous filter
+                ? generation.parsedInput.data.concat(
+                    generation.parsedOutput.success
+                      ? [
+                          {
+                            role: "assistant",
+                            content: generation.parsedOutput.data.completion,
+                          },
+                        ]
+                      : [],
+                  )
+                : [],
+            )
+            // to jsonl
+            .map((row) => JSON.stringify(row))
+            .join("\n");
+          break;
+        default:
+          throw new Error("Invalid export file format");
+      }
+
+      const fileName = `lf-export-${
+        input.projectId
+      }-${new Date().toISOString()}.${
+        exportOptions[input.fileFormat].extension
+      }`;
+
+      if (
+        env.S3_BUCKET_NAME &&
+        env.S3_ACCESS_KEY_ID &&
+        env.S3_SECRET_ACCESS_KEY &&
+        env.S3_ENDPOINT &&
+        env.S3_REGION
+      ) {
+        const client = new S3Client({
+          credentials: {
+            accessKeyId: env.S3_ACCESS_KEY_ID,
+            secretAccessKey: env.S3_SECRET_ACCESS_KEY,
+          },
+          endpoint: env.S3_ENDPOINT,
+          region: env.S3_REGION,
+        });
+        await client.send(
+          new PutObjectCommand({
+            Bucket: env.S3_BUCKET_NAME,
+            Key: fileName,
+            Body: output,
+            ContentType: exportOptions[input.fileFormat].fileType,
+            Expires: new Date(Date.now() + 60 * 60 * 1000), // in 1 hour, file will be deleted
           }),
-        },
-      ];
+        );
+        const signedUrl = await getSignedUrl(
+          client,
+          new GetObjectCommand({
+            Bucket: env.S3_BUCKET_NAME,
+            Key: fileName,
+            ResponseContentDisposition: `attachment; filename="${fileName}"`,
+          }),
+          {
+            expiresIn: 60 * 60, // in 1 hour, signed url will expire
+          },
+        );
+        return {
+          type: "s3",
+          url: signedUrl,
+          fileName,
+        } as const;
+      } else {
+        return {
+          type: "data",
+          data: output,
+          fileName,
+        } as const;
+      }
     }),
-  byId: protectedProcedure.input(z.string()).query(async ({ input, ctx }) => {
-    // also works for other observations
-    const generation = (await ctx.prisma.observation.findFirstOrThrow({
-      where: {
-        id: input,
+  filterOptions: protectedProjectProcedure
+    .input(z.object({ projectId: z.string() }))
+    .query(async ({ input, ctx }) => {
+      const queryFilter = {
+        projectId: input.projectId,
         type: "GENERATION",
-        trace: {
-          project: {
-            members: {
-              some: {
-                userId: ctx.session.user.id,
-              },
-            },
-          },
-        },
-      },
-    })) as Generation;
+      } as const;
 
-    // No need to check for permissions as user has access to the trace
-    const scores = await ctx.prisma.score.findMany({
-      where: {
-        traceId: generation.traceId,
-      },
-    });
+      const model = await ctx.prisma.observation.groupBy({
+        by: ["model"],
+        where: queryFilter,
+        _count: { _all: true },
+      });
+      const name = await ctx.prisma.observation.groupBy({
+        by: ["name"],
+        where: queryFilter,
+        _count: { _all: true },
+      });
+      const traceName = await ctx.prisma.$queryRaw<
+        Array<{
+          traceName: string | null;
+          count: number;
+        }>
+      >(Prisma.sql`
+        SELECT
+          t.name "traceName",
+          count(*)::int AS count
+        FROM traces t
+        JOIN observations o ON o.trace_id = t.id
+        WHERE o.type = 'GENERATION'
+          AND o.project_id = ${input.projectId}
+          AND t.project_id = ${input.projectId}
+        GROUP BY 1
+      `);
 
-    return { ...generation, scores };
-  }),
+      // typecheck filter options, needs to include all columns with options
+      const res: ObservationOptions = {
+        model: model
+          .filter((i) => i.model !== null)
+          .map((i) => ({
+            value: i.model as string,
+            count: i._count._all,
+          })),
+        name: name
+          .filter((i) => i.name !== null)
+          .map((i) => ({
+            value: i.name as string,
+            count: i._count._all,
+          })),
+        traceName: traceName
+          .filter((i) => i.traceName !== null)
+          .map((i) => ({
+            value: i.traceName as string,
+            count: i.count,
+          })),
+      };
+      return res;
+    }),
 });

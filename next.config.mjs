@@ -4,7 +4,7 @@
  */
 await import("./src/env.mjs");
 import { withSentryConfig } from "@sentry/nextjs";
-
+import { env } from "./src/env.mjs";
 
 /** @type {import("next").NextConfig} */
 const nextConfig = {
@@ -20,7 +20,51 @@ const nextConfig = {
     locales: ["en"],
     defaultLocale: "en",
   },
-  output: 'standalone',
+  output: "standalone",
+
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: [
+          {
+            key: "x-frame-options",
+            value: "SAMEORIGIN",
+          },
+        ],
+      },
+      // Required to check authentication status from langfuse.com
+      ...(env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION !== undefined ?
+        [
+          {
+            source: "/api/auth/session",
+            headers: [
+              {
+                key: "Access-Control-Allow-Origin",
+                value: "https://langfuse.com",
+              },
+              { key: "Access-Control-Allow-Credentials", value: "true" },
+              { key: "Access-Control-Allow-Methods", value: "GET,POST" },
+              {
+                key: "Access-Control-Allow-Headers",
+                value: "Content-Type, Authorization",
+              },
+            ]
+          },
+        ] : []
+      )
+    ]
+  },
+
+  // webassembly support for @dqbd/tiktoken
+  webpack(config) {
+    config.experiments = {
+      asyncWebAssembly: true,
+      layers: true,
+    };
+
+    return config;
+  },
   sentry: {
     // See the sections below for information on the following options:
     //   'Configure Source Maps':
@@ -36,7 +80,7 @@ const nextConfig = {
     //     - excludeServerRoutes
     //   'Configure Tunneling':
     //     - tunnelRoute
-    tunnelRoute: '/api/monitoring-tunnel',
+    tunnelRoute: "/api/monitoring-tunnel",
   },
 };
 
@@ -56,4 +100,4 @@ const sentryWebpackPluginOptions = {
   // https://github.com/getsentry/sentry-webpack-plugin#options.
 };
 
-export default withSentryConfig(nextConfig, sentryWebpackPluginOptions)
+export default withSentryConfig(nextConfig, sentryWebpackPluginOptions);
